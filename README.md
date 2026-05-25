@@ -8,32 +8,49 @@ Covers the exact mechanisms used by LangChain, AWS Bedrock AgentCore, and Mem0.
 | File | What it teaches |
 |---|---|
 | `agent.py` | Core agent: ReAct loop, tool routing, short + long-term memory |
-| `semantic_memory.py` | Bonus: vector similarity search (how Pinecone/pgvector works) |
+| `semantic_memory.py` | Vector memory: OpenAI embeddings + cosine similarity search |
 
 ## Setup
 
 ```bash
-# 1. Create and activate virtual env
+# 1. Create project folder and activate virtual env
+mkdir agent-from-scratch && cd agent-from-scratch
 python3 -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 
 # 2. Install dependencies
 pip install openai python-dotenv
 
-# 3. Create .env file in the project folder
+# 3. Create .env file
 echo "OPENAI_API_KEY=sk-...your-key-here" > .env
 
-# 4. Run
+# 4. Place both files in the folder
+#    agent.py  +  semantic_memory.py
+
+# 5. Run
 python agent.py
 ```
 
 Get your API key at https://platform.openai.com/api-keys
 
+## How the two files connect
+
+```
+agent.py
+  └── from semantic_memory import SemanticMemory
+        ├── Agent.__init__()       → self.long_term = SemanticMemory()
+        ├── tool_remember()        → _semantic_memory.save(key, value)
+        ├── tool_recall()          → _semantic_memory.search(query)
+        ├── _build_system_prompt() → _semantic_memory.search(user_input)  [memory injection]
+        └── compress_if_needed()   → _semantic_memory.save_summary(text)
+```
+
+`agent.py` imports and owns one `SemanticMemory` instance.
+All memory reads and writes go through it — keyword matching is gone entirely.
+
 ## Architecture walkthrough
 
 ### 1. ReAct loop (`Agent._react_loop`)
-
-The loop that runs on every user turn:
 
 ```
 User message
@@ -45,18 +62,14 @@ tool_calls in response? ──YES──→ execute tools → append results → 
 msg.content = final answer → return to user
 ```
 
-This is the **exact same pattern** as:
-- LangGraph's `create_react_agent`
-- AWS Bedrock's native agent runtime
-- OpenAI's Assistants API
+Same pattern as LangGraph's `create_react_agent` and AWS Bedrock's agent runtime.
 
 ### 2. Tool system (`TOOLS` dict)
 
-Each tool is:
 ```python
 {
-  "fn": python_function,       # actual executor
-  "schema": {                  # what the LLM reads (OpenAI format)
+  "fn": python_function,
+  "schema": {
       "type": "function",
       "function": {
           "name": "...",
@@ -67,93 +80,82 @@ Each tool is:
 }
 ```
 
-The LLM reads the schemas and decides when to call tools.
-The router (`_execute_tool`) dispatches by name.
-
 ### 3. Short-term memory (`ShortTermMemory`)
 
-In-memory message buffer for this session.
-Compresses itself when it grows too large (summary → inject back).
+In-RAM message buffer. Compresses itself when it hits 20 messages —
+summarises the oldest half and saves the summary to `SemanticMemory`.
 
 ```
 Real-world equivalent:
-  LangGraph Checkpointer (MemorySaver / PostgresSaver)
+  LangGraph MemorySaver / PostgresSaver
   AWS AgentCore AgentCoreMemorySaver
 ```
 
-### 4. Long-term memory (`LongTermMemory`)
+### 4. Long-term memory (`SemanticMemory` from semantic_memory.py)
 
-SQLite-backed key-value store + conversation summaries.
-Persists across sessions. Injected into the system prompt at the start
-of each turn (memory injection pattern).
-
-```
-Real-world equivalent:
-  DynamoDB + LangChain DynamoDBChatMessageHistory
-  AWS AgentCore AgentCoreMemoryStore
-  Mem0's user-scope memory
-```
-
-### 5. Semantic memory (`semantic_memory.py`)
-
-Embeds text to float vectors. Searches by cosine similarity.
-Shows how Pinecone / pgvector / Weaviate work internally.
+SQLite-backed vector store. Every fact is embedded with
+`text-embedding-3-small` (1536-dim) and stored as a JSON float array.
+On retrieval, the query is embedded and compared via cosine similarity.
 
 ```
 Real-world equivalent:
-  pgvector's <=> operator
-  Pinecone similarity search
+  pgvector table  (cosine_similarity ≈ pgvector's <=> operator)
+  Pinecone collection
   LangChain VectorStoreRetrieverMemory
 ```
 
-## Message format (OpenAI API)
+### 5. Memory injection (`Agent._build_system_prompt`)
 
-Understanding this is crucial. The conversation is a list of dicts:
+Before every LLM call:
+1. Search `SemanticMemory` for facts relevant to the current input
+2. Prepend them to the system prompt
+
+This is exactly what Mem0, AgentCore, and LangMem do on each invocation.
+
+## Message format (OpenAI API)
 
 ```python
 [
-  # System prompt is always first
-  {"role": "system", "content": "You are a helpful assistant..."},
+  {"role": "system",    "content": "You are a helpful assistant..."},
+  {"role": "user",      "content": "What is 2^16?"},
 
-  {"role": "user", "content": "What is 2^16?"},
-
-  # LLM decided to use a tool — appended directly (NOT via add()):
+  # Tool call — append directly to messages list, NOT via add():
   {
     "role": "assistant",
-    "content": None,               # may be None when tool_calls present
+    "content": None,
     "tool_calls": [
-      {
-        "id": "call_abc123",
-        "type": "function",
-        "function": {"name": "calculator", "arguments": "{\"expression\": \"2**16\"}"}
-      }
+      {"id": "call_abc", "type": "function",
+       "function": {"name": "calculator", "arguments": "{\"expression\": \"2**16\"}"}}
     ]
   },
 
-  # Tool result goes back as role="tool" (OpenAI convention):
-  {"role": "tool", "tool_call_id": "call_abc123", "content": "65536"},
+  # Tool result — role="tool" with matching tool_call_id:
+  {"role": "tool", "tool_call_id": "call_abc", "content": "65536"},
 
-  # LLM gives final answer:
   {"role": "assistant", "content": "2^16 is 65536."}
 ]
 ```
 
-### Key gotcha: appending tool-call assistant messages
+### Key gotcha: tool-call assistant messages
 
-When the assistant response contains `tool_calls`, you must append
-the message **directly** to `short_term.messages`, not via `add()`.
-
-`add(role, content)` always builds `{"role": role, "content": content}`.
-Passing a dict as `content` nests it incorrectly:
+`add(role, content)` builds `{"role": role, "content": content}`.
+Passing a dict as content nests it incorrectly — OpenAI returns 400.
 
 ```python
-# WRONG — nests the dict under "content":
-self.short_term.add("assistant", {"role": "assistant", "tool_calls": [...]})
-# produces: {"role": "assistant", "content": {"role": ..., "tool_calls": ...}}
+# WRONG:
+self.short_term.add("assistant", {"tool_calls": [...]})
 
-# CORRECT — append the full dict flat:
+# CORRECT:
 self.short_term.messages.append({"role": "assistant", "content": None, "tool_calls": [...]})
 ```
+
+## Files generated at runtime
+
+| File | Contents |
+|---|---|
+| `agent_semantic_memory.db` | Facts + summaries with embeddings (persists across runs) |
+
+Type `memory` during interactive mode to inspect the current buffer and DB.
 
 ## Extending this agent
 
@@ -167,21 +169,16 @@ def tool_web_search(query: str) -> str:
     )
     return resp.json()["results"][0]["content"]
 ```
-Add to `TOOLS` with a schema in the same `"type": "function"` format — done.
+Add `pip install requests` and register in `TOOLS` with a schema.
 
-### Swap SQLite for PostgreSQL
+### Swap SQLite for PostgreSQL + pgvector
 ```python
-# In LongTermMemory.__init__:
+# In SemanticMemory.__init__:
 import psycopg2
 self.conn = psycopg2.connect(os.environ["DATABASE_URL"])
+# Replace cosine_similarity() with pgvector's <=> operator for ANN at scale
 ```
-
-### Add vector search
-Replace `LongTermMemory` with `SemanticMemory` from `semantic_memory.py`.
-Uses OpenAI `text-embedding-3-small` for real embeddings — just set
-`OPENAI_API_KEY` in your `.env` (same key, no extra setup).
 
 ### Multi-agent setup
 Run two `Agent` instances. Give one a `handoff_to_specialist` tool that
-posts to a queue. The second agent polls the queue. That's a multi-agent
-pipeline — same principles, just more instances.
+posts to a queue. The second agent polls the queue. Same principles, more instances.

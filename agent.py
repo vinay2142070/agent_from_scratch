@@ -3,14 +3,14 @@
   BUILD AN AI AGENT FROM SCRATCH — no frameworks
   Matches real-world agent patterns (ReAct loop, tool use,
   short-term + long-term memory, multi-turn conversation)
-  
-  ** OpenAI version (gpt-4o) **
+
+  ** OpenAI version (gpt-4o) + SemanticMemory **
 ==============================================================
 
 ARCHITECTURE:
   User input
       ↓
-  [Memory] inject context
+  [SemanticMemory] inject relevant facts via vector search
       ↓
   LLM call  ← this is the "planner"
       ↓
@@ -22,9 +22,8 @@ CONCEPTS COVERED:
   1. ReAct loop  (Reason → Act → Observe → Reason ...)
   2. Tool definition & routing
   3. Short-term memory  (conversation buffer in this session)
-  4. Long-term memory   (SQLite — persists across runs)
-  5. Semantic memory    (vector similarity search w/ numpy)
-  6. Prompt engineering for tool use
+  4. Long-term memory   (SemanticMemory — SQLite + vector search)
+  5. Prompt engineering for tool use
 """
 
 import os
@@ -35,13 +34,22 @@ import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
 
+# Import SemanticMemory — this replaces the old keyword-based LongTermMemory
+from semantic_memory import SemanticMemory
+
 load_dotenv()
+
 
 # ─────────────────────────────────────────────
 # SECTION 1: TOOL DEFINITIONS
 # Tools are just Python functions + a JSON schema
 # that the LLM reads to know what's available.
 # ─────────────────────────────────────────────
+
+# Module-level SemanticMemory instance shared by tool functions
+# (initialised once in Agent.__init__, assigned here)
+_semantic_memory: SemanticMemory = None
+
 
 def tool_calculator(expression: str) -> str:
     """Safely evaluate a math expression."""
@@ -61,23 +69,20 @@ def tool_get_datetime(timezone: str = "UTC") -> str:
 
 
 def tool_remember(key: str, value: str) -> str:
-    """Save a fact to long-term memory (SQLite)."""
-    db = LongTermMemory()
-    db.save(key, value)
+    """Save a fact to long-term semantic memory."""
+    _semantic_memory.save(key, value)
     return f"Saved: {key} = {value}"
 
 
 def tool_recall(query: str) -> str:
-    """Retrieve facts from long-term memory by fuzzy search."""
-    db = LongTermMemory()
-    results = db.search(query)
+    """Retrieve semantically similar facts from long-term memory."""
+    results = _semantic_memory.search(query)
     if not results:
         return "Nothing found in long-term memory."
     return "\n".join(f"- [{k}] {v}" for k, v in results)
 
 
 # OpenAI tool schema format uses "function" wrapper
-# (different from Anthropic's flat schema format)
 TOOLS = {
     "calculator": {
         "fn": tool_calculator,
@@ -140,7 +145,7 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "recall",
-                "description": "Search long-term memory for facts or preferences.",
+                "description": "Search long-term memory for facts or preferences using semantic similarity.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -155,69 +160,9 @@ TOOLS = {
 
 
 # ─────────────────────────────────────────────
-# SECTION 2: LONG-TERM MEMORY (SQLite)
-# ─────────────────────────────────────────────
-
-class LongTermMemory:
-    def __init__(self, db_path: str = "agent_memory.db"):
-        self.conn = sqlite3.connect(db_path)
-        self._init_schema()
-
-    def _init_schema(self):
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS facts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                key TEXT NOT NULL,
-                value TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS summaries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                summary TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        self.conn.commit()
-
-    def save(self, key: str, value: str):
-        existing = self.conn.execute(
-            "SELECT id FROM facts WHERE key = ?", (key,)
-        ).fetchone()
-        if existing:
-            self.conn.execute("UPDATE facts SET value = ? WHERE key = ?", (value, key))
-        else:
-            self.conn.execute("INSERT INTO facts (key, value) VALUES (?, ?)", (key, value))
-        self.conn.commit()
-
-    def search(self, query: str, limit: int = 5):
-        words = query.lower().split()
-        results = self.conn.execute(
-            "SELECT key, value FROM facts ORDER BY created_at DESC LIMIT 50"
-        ).fetchall()
-        scored = []
-        for key, value in results:
-            text = (key + " " + value).lower()
-            score = sum(1 for w in words if w in text)
-            if score > 0:
-                scored.append((score, key, value))
-        scored.sort(reverse=True)
-        return [(k, v) for _, k, v in scored[:limit]]
-
-    def save_summary(self, summary: str):
-        self.conn.execute("INSERT INTO summaries (summary) VALUES (?)", (summary,))
-        self.conn.commit()
-
-    def get_recent_summaries(self, limit: int = 3):
-        rows = self.conn.execute(
-            "SELECT summary FROM summaries ORDER BY created_at DESC LIMIT ?", (limit,)
-        ).fetchall()
-        return [r[0] for r in rows]
-
-
-# ─────────────────────────────────────────────
-# SECTION 3: SHORT-TERM MEMORY
+# SECTION 2: SHORT-TERM MEMORY
+# In-RAM message buffer for this session.
+# Compresses itself when it grows too large.
 # ─────────────────────────────────────────────
 
 class ShortTermMemory:
@@ -232,7 +177,12 @@ class ShortTermMemory:
     def get_all(self) -> list[dict]:
         return self.messages
 
-    def compress_if_needed(self, llm_client, system_prompt: str):
+    def compress_if_needed(self, llm_client: OpenAI, system_prompt: str):
+        """
+        When buffer grows large, summarise the oldest half and replace with
+        a synthetic summary message. Also saves summary to SemanticMemory
+        for cross-session recall.
+        """
         if len(self.messages) < self.MAX_MESSAGES:
             return
 
@@ -249,7 +199,6 @@ class ShortTermMemory:
             )
         )
 
-        # OpenAI call — system goes inside messages list
         resp = llm_client.chat.completions.create(
             model="gpt-4o-mini",
             max_tokens=300,
@@ -260,7 +209,8 @@ class ShortTermMemory:
         )
         summary = resp.choices[0].message.content
 
-        LongTermMemory().save_summary(summary)
+        # Save summary into SemanticMemory so it persists across sessions
+        _semantic_memory.save_summary(summary)
 
         self.messages.insert(0, {
             "role": "user",
@@ -274,7 +224,7 @@ class ShortTermMemory:
 
 
 # ─────────────────────────────────────────────
-# SECTION 4: THE AGENT (ReAct loop)
+# SECTION 3: THE AGENT (ReAct loop)
 # ─────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a helpful AI assistant with access to tools and memory.
@@ -284,7 +234,7 @@ use the appropriate tool. Always think step by step.
 
 You have two types of memory:
 - Short-term: the current conversation (already in your context)
-- Long-term: facts saved across sessions (use `recall` to search, `remember` to save)
+- Long-term: facts saved across sessions via vector search (use `recall` to search, `remember` to save)
 
 Be concise and direct. After using a tool, interpret the result naturally."""
 
@@ -293,19 +243,32 @@ class Agent:
     MAX_ITERATIONS = 10
 
     def __init__(self):
-        self.client = OpenAI()  # reads OPENAI_API_KEY from env automatically
+        global _semantic_memory
+
+        self.client = OpenAI()               # reads OPENAI_API_KEY from .env
         self.short_term = ShortTermMemory()
-        self.long_term = LongTermMemory()
+        self.long_term = SemanticMemory()    # vector-backed long-term memory
+        _semantic_memory = self.long_term    # wire up tool functions
         self.tool_schemas = [t["schema"] for t in TOOLS.values()]
 
     def _build_system_prompt(self, user_input: str) -> str:
+        """
+        Memory injection: search SemanticMemory for facts relevant to the
+        current input and prepend them to the system prompt.
+
+        This is the exact mechanism used by Mem0, AgentCore, and LangMem
+        before every LLM call — the difference is we use real vector
+        similarity instead of keyword matching.
+        """
         prompt = SYSTEM_PROMPT
 
+        # Cross-session summaries
         summaries = self.long_term.get_recent_summaries(limit=2)
         if summaries:
             prompt += "\n\nContext from previous sessions:\n"
             prompt += "\n".join(f"- {s}" for s in summaries)
 
+        # Semantically relevant facts
         relevant_facts = self.long_term.search(user_input, limit=4)
         if relevant_facts:
             prompt += "\n\nRelevant facts from memory:\n"
@@ -326,24 +289,20 @@ class Agent:
         """
         OpenAI ReAct loop.
 
-        Key differences from Anthropic version:
-        - System prompt goes as first message with role="system"
-        - Tool calls are in response.choices[0].message.tool_calls
-        - Tool results go back as role="tool" messages (not role="user")
-        - assistant message must be appended as dict, not as object
-        - tool_call_id links result back to the call
-
         Message flow:
           {role: system,     content: "You are..."}
           {role: user,       content: "What is 2^16?"}
           {role: assistant,  tool_calls: [{id, function: {name, arguments}}]}
           {role: tool,       tool_call_id: id, content: "65536"}
           {role: assistant,  content: "2^16 is 65536."}
+
+        Key rule: assistant tool-call messages must be appended directly
+        to short_term.messages (not via add()), otherwise the dict gets
+        nested under "content" and OpenAI returns a 400 error.
         """
         for iteration in range(self.MAX_ITERATIONS):
             print(f"  [loop] iteration {iteration + 1}")
 
-            # System prompt is prepended as a message each time
             messages = [{"role": "system", "content": system}] + self.short_term.get_all()
 
             response = self.client.chat.completions.create(
@@ -357,10 +316,10 @@ class Agent:
 
             # Case 1: model wants to call tools
             if msg.tool_calls:
-                # Append directly — NOT via add(), which would nest it under "content"
+                # Append directly — NOT via add()
                 self.short_term.messages.append({
                     "role": "assistant",
-                    "content": msg.content,  # may be None — that's fine
+                    "content": msg.content,   # may be None — that's fine
                     "tool_calls": [
                         {
                             "id": tc.id,
@@ -374,14 +333,12 @@ class Agent:
                     ]
                 })
 
-                # Execute each tool, append result as role="tool"
                 for tc in msg.tool_calls:
                     tool_input = json.loads(tc.function.arguments)
                     print(f"  [tool] calling {tc.function.name}({tool_input})")
                     result = self._execute_tool(tc.function.name, tool_input)
                     print(f"  [tool] result: {result[:80]}")
 
-                    # Each tool result is its own message in OpenAI format
                     self.short_term.messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -407,12 +364,12 @@ class Agent:
 
 
 # ─────────────────────────────────────────────
-# SECTION 5: RUN IT
+# SECTION 4: RUN IT
 # ─────────────────────────────────────────────
 
 def main():
     print("=" * 60)
-    print("  AI Agent (OpenAI gpt-4o) — ReAct + Memory demo")
+    print("  AI Agent (OpenAI gpt-4o) — ReAct + SemanticMemory")
     print("  Type 'quit' to exit, 'memory' to inspect state")
     print("=" * 60)
 
@@ -432,6 +389,9 @@ def main():
     #     print(f"Agent: {response}")
     #     print("-" * 40)
 
+    # Reset short-term buffer — demo leaves tool messages that would
+    # cause OpenAI 400: "tool message with no preceding tool_calls"
+    agent.short_term.messages = []
     print("\n[Demo done. Entering interactive mode]\n")
     while True:
         try:
@@ -452,8 +412,8 @@ def main():
                     print(f"  {role}: {content[:80]}")
                 else:
                     print(f"  {role}: [structured]")
-            print("\n--- Long-term facts ---")
-            conn = sqlite3.connect("agent_memory.db")
+            print("\n--- Long-term facts (semantic DB) ---")
+            conn = sqlite3.connect("agent_semantic_memory.db")
             rows = conn.execute("SELECT key, value FROM facts ORDER BY created_at DESC LIMIT 10").fetchall()
             for k, v in rows:
                 print(f"  [{k}] {v}")

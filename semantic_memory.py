@@ -91,7 +91,26 @@ class SemanticMemory:
                 created_at TEXT DEFAULT (datetime('now'))
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                summary TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
         self.conn.commit()
+
+    def save_summary(self, summary: str):
+        """Save a compressed conversation summary for cross-session context."""
+        self.conn.execute("INSERT INTO summaries (summary) VALUES (?)", (summary,))
+        self.conn.commit()
+
+    def get_recent_summaries(self, limit: int = 3) -> list[str]:
+        """Return the most recent conversation summaries."""
+        rows = self.conn.execute(
+            "SELECT summary FROM summaries ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def save(self, key: str, value: str):
         text_to_embed = f"{key}: {value}"
