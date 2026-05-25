@@ -1,6 +1,6 @@
 """
-BONUS: Semantic (vector) memory using numpy
-============================================
+BONUS: Semantic (vector) memory using OpenAI embeddings
+========================================================
 This shows how vector search actually works under the hood —
 the same mechanism used by Pinecone, Weaviate, pgvector, etc.
 
@@ -9,13 +9,18 @@ semantic search embeds text into vectors and finds the
 nearest neighbours using cosine similarity.
 
 Drop-in replacement for LongTermMemory.search().
-Requires: pip install numpy anthropic
+Requires: pip install openai python-dotenv
+Same OPENAI_API_KEY in .env — no extra setup needed.
 """
 
+import os
 import json
 import math
 import sqlite3
-import anthropic
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -32,63 +37,47 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def get_embedding(text: str, client: anthropic.Anthropic) -> list[float]:
+def get_embedding(text: str, client: OpenAI) -> list[float]:
     """
-    Get a text embedding from Claude.
-    In production: use a dedicated embedding model
-    (text-embedding-3-small, Cohere embed, etc.)
-    Here we simulate it cheaply via a short LLM call.
+    Get a real text embedding from OpenAI.
 
-    Real production flow:
-      client = openai.OpenAI()
-      resp = client.embeddings.create(
-          input=text, model="text-embedding-3-small"
-      )
-      return resp.data[0].embedding  # 1536-dim float list
+    text-embedding-3-small returns a 1536-dim float vector.
+    Semantically similar texts produce vectors with high cosine similarity,
+    even if they share no exact words.
+
+    Cost: ~$0.00002 per 1K tokens — effectively free for this use case.
     """
-    # Simplified: ask Claude to return a JSON float array as a fingerprint.
-    # NOT real embeddings — just for illustration without extra API keys.
-    resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=200,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"Return ONLY a JSON array of 16 floats between -1 and 1 "
-                f"that semantically represents this text. "
-                f"No explanation, just the array.\n\nText: {text}"
-            )
-        }]
+    resp = client.embeddings.create(
+        input=text,
+        model="text-embedding-3-small"
     )
-    try:
-        return json.loads(resp.content[0].text.strip())
-    except Exception:
-        # Fallback: hash-based pseudo-embedding
-        h = hash(text)
-        return [(((h >> (i * 4)) & 0xF) / 7.5) - 1.0 for i in range(16)]
+    return resp.data[0].embedding  # list of 1536 floats
 
 
 class SemanticMemory:
     """
-    Vector-based long-term memory.
-    
+    Vector-based long-term memory backed by SQLite.
+
     Storage layout:
       facts table: id, key, value, embedding (JSON float array)
-    
+
     On save:   embed the value → store vector alongside text
     On search: embed the query → cosine similarity against all stored vectors
                → return top-K results above threshold
-    
+
     Real-world equivalent:
       - This class ≈ a Pinecone collection / pgvector table
       - cosine_similarity() ≈ pgvector's <=> operator
-      - get_embedding() ≈ text-embedding-3-small API call
+      - get_embedding() ≈ OpenAI text-embedding-3-small API call
+
+    To scale beyond ~10k entries: swap SQLite for pgvector or Pinecone
+    and replace the Python cosine loop with a native ANN index query.
     """
 
-    SIMILARITY_THRESHOLD = 0.5
+    SIMILARITY_THRESHOLD = 0.4  # lower than keyword search since vectors are denser
 
     def __init__(self, db_path: str = "agent_semantic_memory.db"):
-        self.client = anthropic.Anthropic()
+        self.client = OpenAI()  # reads OPENAI_API_KEY from env
         self.conn = sqlite3.connect(db_path)
         self._init_schema()
 
@@ -123,12 +112,12 @@ class SemanticMemory:
                 (key, value, emb_json)
             )
         self.conn.commit()
-        print(f"  [semantic memory] saved '{key}' with {len(embedding)}-dim embedding")
+        print(f"  [semantic memory] saved '{key}' ({len(embedding)}-dim vector)")
 
     def search(self, query: str, limit: int = 5) -> list[tuple[str, str]]:
         """
         1. Embed the query
-        2. Load all stored embeddings
+        2. Load all stored embeddings from SQLite
         3. Compute cosine similarity for each
         4. Return top-K above threshold
         """
@@ -146,13 +135,13 @@ class SemanticMemory:
 
         scored.sort(reverse=True)
         results = [(k, v) for _, k, v in scored[:limit]]
-        print(f"  [semantic memory] query '{query[:40]}' → {len(results)} results")
+        print(f"  [semantic memory] '{query[:40]}' → {len(results)} results")
         return results
 
 
 # ─────────────────────────────────────────────
-# Demo: show how semantic search finds related
-# facts even without exact keyword overlap
+# Demo: semantic search finds related facts
+# even without exact keyword overlap
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -164,20 +153,17 @@ if __name__ == "__main__":
     mem.save("user_name", "VK")
     mem.save("user_location", "Bengaluru, India")
     mem.save("user_preference", "prefers concise answers")
-    mem.save("user_stack", "uses n8n, Claude API, SQLite for automation")
+    mem.save("user_stack", "uses n8n, OpenAI API, SQLite for automation")
     mem.save("user_hobby", "building AI assistants on Telegram")
 
-    print("\n[Searching for 'automation tools'...]")
-    results = mem.search("automation tools")
-    for k, v in results:
+    print("\n[Searching: 'automation tools']")
+    for k, v in mem.search("automation tools"):
         print(f"  [{k}] {v}")
 
-    print("\n[Searching for 'where does the user live'...]")
-    results = mem.search("where does the user live")
-    for k, v in results:
+    print("\n[Searching: 'where does the user live']")
+    for k, v in mem.search("where does the user live"):
         print(f"  [{k}] {v}")
 
-    print("\n[Searching for 'messaging app bot'...]")
-    results = mem.search("messaging app bot")
-    for k, v in results:
+    print("\n[Searching: 'messaging app bot']")
+    for k, v in mem.search("messaging app bot"):
         print(f"  [{k}] {v}")
