@@ -76,3 +76,7 @@ Thumbs.db
 
 # Project specific
 node_modules/
+
+
+#memory DB
+*.db
