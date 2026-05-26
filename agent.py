@@ -31,6 +31,7 @@ import json
 import math
 import sqlite3
 import datetime
+import requests
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -80,6 +81,45 @@ def tool_recall(query: str) -> str:
     if not results:
         return "Nothing found in long-term memory."
     return "\n".join(f"- [{k}] {v}" for k, v in results)
+
+
+def tool_web_search(query: str, num_results: int = 5) -> str:
+    """Search the web via Serper (Google) and return top results."""
+    api_key = os.getenv("SERPER_API_KEY")
+    if not api_key:
+        return "Error: SERPER_API_KEY not set in .env"
+    try:
+        resp = requests.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            json={"q": query, "num": min(num_results, 10)},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("organic", [])[:num_results]
+        if not items:
+            return "No results found."
+        lines = []
+        for item in items:
+            lines.append(f"Title: {item.get('title')}")
+            lines.append(f"URL:   {item.get('link')}")
+            lines.append(f"Snippet: {item.get('snippet', '')}")
+            lines.append("")
+        return "\n".join(lines).strip()
+    except Exception as e:
+        return f"Search error: {e}"
+
+
+def tool_http_get(url: str, headers: dict = None) -> str:
+    """Fetch the content of a URL via HTTP GET."""
+    try:
+        resp = requests.get(url, headers=headers or {}, timeout=10)
+        resp.raise_for_status()
+        text = resp.text[:4000]
+        return text if text else "(empty response)"
+    except Exception as e:
+        return f"HTTP error: {e}"
 
 
 # OpenAI tool schema format uses "function" wrapper
@@ -152,6 +192,46 @@ TOOLS = {
                         "query": {"type": "string", "description": "What to search for"}
                     },
                     "required": ["query"]
+                }
+            }
+        }
+    },
+    "web_search": {
+        "fn": tool_web_search,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web using Google (via Serper API). Returns titles, URLs, and snippets. Use for current events, facts you don't know, or anything requiring up-to-date information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query"},
+                        "num_results": {"type": "integer", "description": "Number of results to return (default 5, max 10)"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }
+    },
+    "http_get": {
+        "fn": tool_http_get,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "http_get",
+                "description": "Fetch the raw content of any public URL via HTTP GET. Useful for reading a specific web page, a REST API response, or a raw file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "The full URL to fetch"},
+                        "headers": {
+                            "type": "object",
+                            "description": "Optional HTTP headers as key-value pairs (e.g. Authorization)",
+                            "additionalProperties": {"type": "string"}
+                        }
+                    },
+                    "required": ["url"]
                 }
             }
         }
@@ -229,13 +309,19 @@ class ShortTermMemory:
 
 SYSTEM_PROMPT = """You are a helpful AI assistant with access to tools and memory.
 
-When you need to perform a calculation, get the time, or remember/recall information,
-use the appropriate tool. Always think step by step.
+Always think step by step and use the appropriate tool when needed:
+- Calculations → calculator
+- Current date/time → get_datetime
+- Current events, facts, news → web_search
+- Reading a specific webpage or API → http_get
+- Saving facts for later → remember
+- Recalling past facts → recall
 
 You have two types of memory:
 - Short-term: the current conversation (already in your context)
 - Long-term: facts saved across sessions via vector search (use `recall` to search, `remember` to save)
 
+When using web_search, you can follow up with http_get on a specific result URL to read its full content.
 Be concise and direct. After using a tool, interpret the result naturally."""
 
 
@@ -307,49 +393,77 @@ class Agent:
 
             response = self.client.chat.completions.create(
                 model="gpt-4o",
+                stream=True,
                 max_tokens=1024,
                 tools=self.tool_schemas,
                 messages=messages
             )
 
-            msg = response.choices[0].message
+            # Accumulate streamed deltas
+            content = ""
+            tool_calls_map = {}  # index -> {id, name, arguments}
+            finish_reason = None
+
+            for chunk in response:
+                choice = chunk.choices[0]
+                finish_reason = choice.finish_reason or finish_reason
+                delta = choice.delta
+
+                if delta.content:
+                    content += delta.content
+                    print(delta.content, end="", flush=True)
+
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        entry = tool_calls_map.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
+                        if tc.id:
+                            entry["id"] = tc.id
+                        if tc.function.name:
+                            entry["name"] += tc.function.name
+                        if tc.function.arguments:
+                            entry["arguments"] += tc.function.arguments
+
+            if content:
+                print()  # newline after streamed output
+
+            tool_calls = list(tool_calls_map.values())
 
             # Case 1: model wants to call tools
-            if msg.tool_calls:
+            if tool_calls:
                 # Append directly — NOT via add()
                 self.short_term.messages.append({
                     "role": "assistant",
-                    "content": msg.content,   # may be None — that's fine
+                    "content": content or None,
                     "tool_calls": [
                         {
-                            "id": tc.id,
+                            "id": tc["id"],
                             "type": "function",
                             "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
+                                "name": tc["name"],
+                                "arguments": tc["arguments"]
                             }
                         }
-                        for tc in msg.tool_calls
+                        for tc in tool_calls
                     ]
                 })
 
-                for tc in msg.tool_calls:
-                    tool_input = json.loads(tc.function.arguments)
-                    print(f"  [tool] calling {tc.function.name}({tool_input})")
-                    result = self._execute_tool(tc.function.name, tool_input)
+                for tc in tool_calls:
+                    tool_input = json.loads(tc["arguments"])
+                    print(f"  [tool] calling {tc['name']}({tool_input})")
+                    result = self._execute_tool(tc["name"], tool_input)
                     print(f"  [tool] result: {result[:80]}")
 
                     self.short_term.messages.append({
                         "role": "tool",
-                        "tool_call_id": tc.id,
+                        "tool_call_id": tc["id"],
                         "content": result
                     })
                 continue
 
             # Case 2: final text answer
-            if msg.content:
-                self.short_term.add("assistant", msg.content)
-                return msg.content
+            if content:
+                self.short_term.add("assistant", content)
+                return content
 
             return "Agent finished with no output."
 
