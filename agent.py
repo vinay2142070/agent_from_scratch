@@ -57,6 +57,16 @@ from semantic_memory import SemanticMemory
 load_dotenv()
 
 
+def _print_usage(label: str, usage) -> None:
+    if usage:
+        print(
+            f"  [tokens:{label}] "
+            f"in={usage.prompt_tokens}  "
+            f"out={usage.completion_tokens}  "
+            f"total={usage.total_tokens}"
+        )
+
+
 # ══════════════════════════════════════════════════════════
 # SECTION 1 — TOOL DEFINITIONS
 #
@@ -369,6 +379,7 @@ class ShortTermMemory:
                 {"role": "user",   "content": summary_prompt}
             ]
         )
+        _print_usage("compress", resp.usage)
         summary = resp.choices[0].message.content
 
         # Persist summary to SemanticMemory for future sessions
@@ -422,7 +433,11 @@ You have two types of memory:
 - Short-term: the current conversation (already in your context)
 - Long-term: facts saved across sessions via vector search (use recall/remember)
 
-When using web_search, you can follow up with http_get on a specific URL to read full content.
+Memory rules:
+- When the user tells you their name, preferences, goals, or any personal fact → call remember immediately
+- When the user asks what you know about them or what was discussed before → call recall first
+- When using web_search, you can follow up with http_get on a specific URL to read full content
+
 Be concise and direct. After using a tool, interpret the result naturally."""
 
 
@@ -510,6 +525,7 @@ class Agent:
             response = self.client.chat.completions.create(
                 model="gpt-4o",
                 stream=True,
+                stream_options={"include_usage": True},
                 max_tokens=1024,
                 tools=self.tool_schemas,
                 messages=messages
@@ -519,8 +535,14 @@ class Agent:
             content = ""
             tool_calls_map: dict[int, dict] = {}  # index → {id, name, arguments}
             finish_reason = None
+            usage = None
 
             for chunk in response:
+                # The final chunk carries usage and has no choices
+                if not chunk.choices:
+                    usage = chunk.usage
+                    continue
+
                 choice = chunk.choices[0]
                 finish_reason = choice.finish_reason or finish_reason
                 delta = choice.delta
@@ -546,6 +568,7 @@ class Agent:
             if content:
                 print()  # newline after streamed output ends
 
+            _print_usage("react", usage)
             tool_calls = list(tool_calls_map.values())
 
             # ── Case 1: LLM wants to call one or more tools ──
@@ -599,11 +622,18 @@ class Agent:
           1. Build system prompt with injected memory
           2. Add user message to short-term buffer
           3. Run the ReAct loop until final answer
-          4. Compress buffer if it's grown too large
+          4. Persist this exchange to long-term memory
+          5. Compress buffer if it's grown too large
         """
         system = self._build_system_prompt(user_input)
         self.short_term.add("user", user_input)
         answer = self._react_loop(system)
+
+        # Always persist the exchange — don't wait for compress_if_needed
+        self.long_term.save_summary(
+            f"User: {user_input[:300]} | Agent: {answer[:300]}"
+        )
+
         self.short_term.compress_if_needed(self.client, system)
         return answer
 
@@ -687,6 +717,7 @@ class Planner:
                 {"role": "user",   "content": f"Goal: {goal}"}
             ]
         )
+        _print_usage("planner", response.usage)
 
         raw = response.choices[0].message.content.strip()
 
@@ -810,6 +841,7 @@ class PlanExecutor:
                 }
             ]
         )
+        _print_usage("synthesise", resp.usage)
         return resp.choices[0].message.content
 
     def run(self, goal: str) -> str:
