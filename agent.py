@@ -68,8 +68,64 @@ from dataclasses import dataclass
 from openai import OpenAI
 from dotenv import load_dotenv
 from semantic_memory import SemanticMemory
+from mcp_client import MCPClientHTTP
 
 load_dotenv()
+
+
+# ══════════════════════════════════════════════════════════
+# TOKEN TRACKER
+#
+# A single _tracker instance shared across the whole file.
+# Every LLM call logs its usage via _tracker.log().
+# A session summary prints when the agent exits.
+#
+# STREAMING CALLS (_react_loop):
+#   Pass stream_options={"include_usage": True} to the API.
+#   Usage only arrives on the LAST chunk — all other chunks
+#   have chunk.usage = None. That final chunk also has an
+#   empty choices list, so guard with: if not chunk.choices: continue
+#
+# NON-STREAMING CALLS (compress, planner, synthesise):
+#   Usage is on response.usage directly — no special handling needed.
+# ══════════════════════════════════════════════════════════
+
+class TokenTracker:
+    """Accumulates token usage across every LLM call in a session."""
+
+    def __init__(self):
+        self.input_total  = 0
+        self.output_total = 0
+        self.call_count   = 0
+
+    def log(self, label: str, input_tokens: int, output_tokens: int):
+        """Print per-call breakdown and update running session totals."""
+        self.input_total  += input_tokens
+        self.output_total += output_tokens
+        self.call_count   += 1
+        call_total    = input_tokens + output_tokens
+        session_total = self.input_total + self.output_total
+        print(
+            f"  [tokens] {label:<22} "
+            f"in: {input_tokens:>6,}  "
+            f"out: {output_tokens:>5,}  "
+            f"call: {call_total:>6,}  "
+            f"│  session: {session_total:,}"
+        )
+
+    def summary(self):
+        """Print cumulative totals for the entire session."""
+        print(
+            f"\n  [tokens] session summary ── "
+            f"calls: {self.call_count}  "
+            f"in: {self.input_total:,}  "
+            f"out: {self.output_total:,}  "
+            f"total: {self.input_total + self.output_total:,}"
+        )
+
+
+# Module-level singleton — imported nowhere, used everywhere in this file
+_tracker = TokenTracker()
 
 
 # ══════════════════════════════════════════════════════════
@@ -287,6 +343,8 @@ class ShortTermMemory:
             ]
         )
         summary = resp.choices[0].message.content
+        if resp.usage:
+            _tracker.log("memory compress", resp.usage.prompt_tokens, resp.usage.completion_tokens)
 
         # Persist to SemanticMemory for future sessions
         if _long_term_memory:
@@ -360,8 +418,8 @@ class Agent:
 
         # ── MCP setup ──────────────────────────────────────
         # Spawn the MCP server subprocess
-        self.mcp = MCPClient("mcp_server.py")
-
+        # self.mcp = MCPClient("mcp_server.py")  # stdio
+        self.mcp = MCPClientHTTP("http://localhost:8000")
         # Discover tools from server, convert to OpenAI format
         # This replaces the old hardcoded TOOLS dict entirely
         mcp_tools = self.mcp.list_tools()
@@ -420,14 +478,25 @@ class Agent:
                 stream=True,
                 max_tokens=1024,
                 tools=self.tool_schemas,
-                messages=messages
+                messages=messages,
+                # stream_options required to get usage on streaming calls.
+                # Without this, chunk.usage is always None.
+                stream_options={"include_usage": True}
             )
 
             content = ""
             tool_calls_map: dict[int, dict] = {}
             finish_reason = None
+            usage = None  # populated by the final chunk only
 
             for chunk in response:
+                # The last chunk carries usage and has an empty choices list.
+                # Guard here prevents IndexError on chunk.choices[0].
+                if chunk.usage is not None:
+                    usage = chunk.usage
+                if not chunk.choices:
+                    continue
+
                 choice = chunk.choices[0]
                 finish_reason = choice.finish_reason or finish_reason
                 delta = choice.delta
@@ -447,6 +516,14 @@ class Agent:
 
             if content:
                 print()
+
+            # Log token usage for this ReAct iteration
+            if usage:
+                _tracker.log(
+                    f"react iter {iteration + 1}",
+                    usage.prompt_tokens,
+                    usage.completion_tokens
+                )
 
             tool_calls = list(tool_calls_map.values())
 
@@ -557,6 +634,8 @@ class Planner:
         )
 
         raw = response.choices[0].message.content.strip()
+        if response.usage:
+            _tracker.log("planner", response.usage.prompt_tokens, response.usage.completion_tokens)
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -629,6 +708,8 @@ class PlanExecutor:
                 {"role": "user",   "content": f"Goal: {goal}\n\nResults:\n{results_block}\n\nWrite a clear final answer."}
             ]
         )
+        if resp.usage:
+            _tracker.log("synthesise", resp.usage.prompt_tokens, resp.usage.completion_tokens)
         return resp.choices[0].message.content
 
     def run(self, goal: str) -> str:
@@ -737,6 +818,8 @@ def main():
     finally:
         # Always shut down the MCP server cleanly
         agent.close()
+        # Print cumulative token usage for the whole session
+        _tracker.summary()
 
 
 if __name__ == "__main__":
